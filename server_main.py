@@ -31,6 +31,10 @@ def check_SQLI(input: str):
             return True
     return False
 
+def isOwner(api_key: str):
+    if api_key == 'ef0f8-e5a039c62-7e58d5b4c6-38095fc-a5cc114e':
+        return True
+    return False
 
 def get_time_range(days: int):
     d = date.today() - timedelta(days=days)
@@ -56,10 +60,16 @@ def get_content_length(headers: list):
 
 
 def get_account(cursor, api_key: str = None, username: str = None, pw: str = None):
+    print(f'Getting account with api_key={api_key}, username={username}, pw={pw}')
     if username is None and pw is None and api_key is not None:
         if check_SQLI(api_key):
             return None
         cursor.execute('SELECT * FROM accounts WHERE (api_key = \'' + api_key + '\') LIMIT 1')
+        return cursor.fetchone()
+    elif username and api_key and isOwner(api_key):
+        if check_SQLI(api_key):
+            return None
+        cursor.execute('SELECT * FROM accounts WHERE (username = \'' + username + '\') LIMIT 1')
         return cursor.fetchone()
     else:
         if check_SQLI(username) or check_SQLI(pw):
@@ -70,6 +80,11 @@ def get_account(cursor, api_key: str = None, username: str = None, pw: str = Non
                                                                                                               'LIMIT '
                                                                                                               '1')
         return cursor.fetchone()
+
+
+def get_account_user(cursor, username: str = None):
+    cursor.execute('SELECT * FROM accounts WHERE username = \'' + username + '\' LIMIT 1')
+    return cursor.fetchone()
 
 
 def post_account(cursor, email: str, password: str, accounts: list = None):
@@ -134,6 +149,8 @@ class MyServer(BaseHTTPRequestHandler):
             request_type = request_type.replace('/api', '')
         else:
             return
+        if request_type.startswith('/chat') or request_type.startswith('/bobby'):
+            return
         queries = []
         email = ''
         pw = ''
@@ -157,7 +174,11 @@ class MyServer(BaseHTTPRequestHandler):
             # read the message and convert it into a python dictionary
             length = get_content_length(self.headers.as_string().split('\n'))
             payload = json.loads(self.rfile.read(int(length)))
-            action_type = payload["action"]
+            try:
+                action_type = payload["action"]
+            except:
+                self.send_error(500)
+                return
 
         if request_type.startswith('/accounts'):
             if check_SQLI(email) or check_SQLI(pw):
@@ -189,19 +210,54 @@ class MyServer(BaseHTTPRequestHandler):
             return
         queries = []
         mac = ''
+        username = ''
         if '?' in request_type:
             queries = request_type.split('?')[1].split('&')
             request_type = request_type.split('?')[0]
         for query in queries:
             if 'mac' in query:
                 mac = query.split('=')[1].strip()
+            elif 'username' in query:
+                username = query.split('=')[1].strip()
         if request_type.startswith('/accounts'):
             if mac == '':
                 self.send_error(407, 'You need to specify a mac address to bind')
                 return
-            self.put_mac(cursor, mac)
+            self.put_mac(cursor, mac, username)
         cnx.commit()
         cnx.close()
+
+    def do_PATCH(self):
+        cnx = mysql.connector.connect(**config)
+        cursor = cnx.cursor()
+
+        request_type = self.path
+        if request_type.startswith('/api'):
+            request_type = request_type.replace('/api', '')
+        else:
+            return
+        queries = []
+        username = ''
+        hasDisko = 0
+        time = 0
+        if '?' in request_type:
+            queries = request_type.split('?')[1].split('&')
+            request_type = request_type.split('?')[0]
+        for query in queries:
+            if 'username' in query:
+                username = query.split('=')[1].strip()
+            elif 'time' in query:
+                time = int(query.split('=')[1].strip())
+            elif 'hasDisko' in query:
+                hasDisko = int(query.split('=')[1].strip())
+        if request_type.startswith('/accounts'):
+            if not username == '':
+                self.patch_user(cursor, username, time, hasDisko)
+            else:
+                self.send_error(404)
+        cnx.commit()
+        cnx.close()
+
 
     def get_ip(self):
         headers = self.headers.as_string().split('\n')
@@ -213,13 +269,16 @@ class MyServer(BaseHTTPRequestHandler):
                 return ip
         return None
 
-    def put_mac(self, cursor, mac_adrr: str):
+    def put_mac(self, cursor, mac_adrr: str, username: str = ''):
         api_key = get_auth_token(self.headers.as_string().split("\n"))
         if check_SQLI(api_key):
             return
         if api_key is None or api_key == '':
             return
-        account = get_account(cursor, api_key)
+        if username == '':
+            account = get_account(cursor, api_key)
+        else:
+            account = get_account_user(cursor, username)
 
         if account is None:
             self.send_error(400, 'Invalid credentials provided',
@@ -236,22 +295,65 @@ class MyServer(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(bytes(str(""), 'utf-8'))
         else:
-            self.send_error(406, 'The account is already bound to another machine, please contact the '
-                                 'administrators if you need to rebind your machine')
+            if isOwner(api_key):
+                cursor.execute(
+                    'update accounts set mac = ' + str(mac_adrr) + ' where api_key = \'' + api_key + '\'')
+                cursor.execute(
+                    'update accounts set ip = \'' + str(self.get_ip()) + '\' where api_key = \'' + api_key + '\'')
+                self.send_response(204, 'The machine has been successfully bound')
+                self.send_header("Content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(bytes(str(""), 'utf-8'))
+            else:
+                self.send_error(406, 'The account is already bound to another machine, please contact the '
+                                     'administrators if you need to rebind your machine')
+
+    def patch_user(self, cursor, username, time: int = 0, hasDisko: int = 0):
+        api_key = get_auth_token(self.headers.as_string().split("\n"))
+        if check_SQLI(api_key) or check_SQLI(api_key):
+            return
+        if api_key is None or api_key == '':
+            return
+        account = get_account_user(cursor, username)
+
+        if account is None:
+            self.send_error(400, 'Invalid credentials provided',
+                            'Username, password, or api_key inserted were not valid')
+            return
+        api_key_user, username, pw, account_creation, hasDiskoOld, mac, ip, disko_expiry = account
+
+        if isOwner(api_key):
+            if disko_expiry is None or disko_expiry == 'NULL':
+                disko_expiry = str(date.today())
+            disko_expiry = str(datetime.strptime(disko_expiry, '%Y-%m-%d') + timedelta(days=time)).split(' ')[0]
+            cursor.execute(
+                'update accounts set hasDisko = ' + str(hasDisko) + ', expiration = \'' + str(disko_expiry) +
+                '\' where username = \'' + username + '\'')
+            cursor.execute(
+                'update accounts set ip = \'' + str(self.get_ip()) + '\' where api_key = \'' + api_key + '\'')
+            self.send_response(204, 'The user has been successfully modified')
+            self.send_header("Content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(bytes(str(""), 'utf-8'))
+        else:
+            self.send_error(401)
+
 
     def get_account_response(self, cursor, username: str = None, pw: str = None):
         api_key = get_auth_token(self.headers.as_string().split("\n"))
         if username is None or username == '':
             if (api_key is None) or check_SQLI(api_key):
                 return
-        if not (username is None and pw is None):
+        if username:
             if check_SQLI(username) or check_SQLI(pw):
                 return
-            account = get_account(cursor, username=username, pw=pw)
+            print(f'Getting account with username={username} and password={pw}')
+            account = get_account(cursor, api_key, username=username, pw=pw)
         else:
             if api_key is None:
                 self.send_error(400)
-            account = get_account(cursor, api_key)
+            print('Getting account with api_key')
+            account = get_account(cursor, api_key, username=username)
         if account is None:
             self.send_error(400, 'Invalid credentials provided',
                             'Username, password, or api_key inserted were not valid')
@@ -268,7 +370,7 @@ class MyServer(BaseHTTPRequestHandler):
             cursor.execute('update accounts set hasDisko = false where api_key = \'' + api_key + '\'')
 
         account = {'api_key': api_key, 'username': username, 'pw': pw, 'mac': mac,
-                   'creation_date': str(account_creation), 'disko': str(hasDisko)}
+                   'creation_date': str(account_creation), 'disko': str(hasDisko), 'expiration_date': str(disko_expiry)}
         json_account = str(json.dumps(account))
         self.send_response(200)
         self.send_header("Content-type", "application/json")
